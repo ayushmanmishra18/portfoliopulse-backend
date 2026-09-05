@@ -1,0 +1,363 @@
+PORTFOLIOPULSE — PROJECT DOCUMENTATION
+=======================================
+
+WHAT IS THIS, FROM ZERO
+------------------------
+Imagine a private-credit or lending firm that manages a portfolio of
+loans and other assets (equity stakes, real estate, etc.) on behalf of
+clients. They need to:
+  - Keep an internal record of every asset: how much was lent
+    (principal), what it's worth now (current value), and its health
+    status (performing / watchlist / default / closed).
+  - Let their own internal tools, scripts, or partner systems read and
+    update that data programmatically, without giving those systems
+    direct database access.
+  - Get notified immediately when something important changes (a loan
+    goes into default, a value is revised), instead of polling for
+    changes.
+
+PortfolioPulse is that system, built as a SaaS product: one deployment
+serves many separate client organizations ("tenants"), each with its own
+isolated data, users, API keys, and webhooks — nobody can see or touch
+another tenant's data. Concretely, PortfolioPulse is:
+
+  1. A dashboard (the React frontend) where a firm's team signs up,
+     creates a workspace, adds/edits/monitors their assets, and manages
+     integration settings (API keys, webhooks).
+  2. A REST API (the Express backend) that is the actual product for
+     external consumption — a client's own systems call it with an API
+     key to read/write asset data, the same way they'd call Stripe's or
+     Plaid's API.
+  3. A webhook system so a client's systems get pushed a signed HTTP
+     notification the moment an asset's status or value changes, instead
+     of having to poll the API on a timer.
+  4. A reliability layer behind that webhook system — because webhook
+     receivers go down, time out, or are briefly unreachable, deliveries
+     are tracked, retried on a backoff schedule, and visible in the
+     dashboard with a manual "Resend" — the same problem every real SaaS
+     webhook provider (Stripe, GitHub, etc.) has to solve.
+  5. An analytics view and usage/quota tracking so a tenant can see their
+     portfolio composition and how much of their monthly API allowance
+     they've used — the groundwork a real billing/plans system would sit
+     on top of.
+
+In short: this is a small-scale, self-contained clone of the pattern
+behind products like Stripe, Plaid, or Twilio — "give a company an API
+and webhooks for a specific domain (here: loan/portfolio data), wrapped
+in a multi-tenant dashboard" — built end-to-end (auth, data model,
+external API, webhook reliability, analytics, and a public marketing
+landing page) as a single project.
+
+WHO WOULD USE EACH PART
+------------------------
+  - A firm's ops/finance team -> uses the dashboard (Overview, Assets,
+    Analytics pages) to manage and monitor the portfolio by hand.
+  - A firm's engineers -> generate an API key (API Keys page) and call
+    the external API (/v1/...) from their own internal systems or
+    scripts to sync asset data automatically.
+  - A firm's engineers, again -> register a webhook (Webhooks page)
+    pointing at their own server so they're notified in real time, and
+    use the built-in Test Endpoint page to see exactly what payload
+    they'd receive before wiring up their own receiver.
+  - A visitor with no account yet -> lands on the public marketing page
+    ("/") first, which explains the product and links to sign up/log in.
+
+END-TO-END FLOW (a concrete example)
+--------------------------------------
+  1. A user registers -> a new Tenant (workspace) and a User with role
+     "owner" are created.
+  2. They log in -> the dashboard shows their (empty) Overview.
+  3. They add an asset, e.g. "Series B Loan — Acme Corp", principal
+     $500,000, status "performing" -> an Asset document is created, and
+     an AssetEvent ("created") is logged for audit history.
+  4. They generate an API key from the API Keys page -> stored hashed,
+     shown once in full so they can copy it into their own system.
+  5. They register a webhook URL and select which events to receive
+     (created / status_change / value_update) -> a Webhook document is
+     created with a generated HMAC secret.
+  6. Their own system later calls PATCH /v1/assets/:id with the API key
+     to mark that loan "watchlist" -> the backend updates the Asset,
+     logs an AssetEvent, and dispatches a "status_change" webhook event.
+  7. The webhook dispatcher signs the payload (HMAC-SHA256) and POSTs it
+     to their registered URL, creating a WebhookDelivery record. If their
+     server is down, the delivery is retried automatically at 1, 5, and
+     30 minutes before being marked "exhausted" (visible + resendable in
+     the dashboard).
+  8. Every external API call is logged (UsageLog) and counted against
+     the tenant's monthly quota; the Analytics page turns that log, plus
+     asset and event data, into charts.
+
+That loop — track data, expose it via API, notify via webhook, retry
+reliably, log usage, visualize it — is the entire product.
+
+TECH STACK
+----------
+Backend:
+  - Express 4, TypeScript
+  - MongoDB via Mongoose
+  - JWT auth (jsonwebtoken) for dashboard users
+  - API-key auth for the external/public API
+  - bcryptjs for password hashing
+  - express-rate-limit for rate limiting
+  - node-cron for scheduled jobs (no external queue/Redis)
+  - axios for outbound webhook HTTP calls
+
+Frontend:
+  - React 19 + TypeScript, Vite build tooling
+  - react-router-dom for routing
+  - axios for API calls
+  - recharts for charts/analytics
+  - lucide-react for icons
+  - Plain CSS (src/App.css) — Stripe/Linear-style design system,
+    no CSS framework
+
+ARCHITECTURE
+------------
+Multi-tenancy: every document in MongoDB (Asset, Webhook, ApiKey, UsageLog,
+WebhookDelivery, TestEndpointEvent, etc.) carries a `tenant` reference, and
+every query is scoped by `req.tenantId` (set by auth middleware from the
+JWT or API key). There is no cross-tenant data access.
+
+Two parallel API surfaces:
+  1. Dashboard API   (/api/...)  — JWT-authenticated, used by the React
+     frontend, generously rate-limited (human users).
+  2. External API    (/v1/...)   — API-key authenticated
+     (`X-API-Key` header), used by a tenant's own external systems,
+     rate-limited per plan/quota (the actual product).
+
+Async processing without a queue: instead of Kafka/BullMQ/Redis, the
+backend uses `node-cron` jobs running inside the same Express process:
+  - webhookRetryJob: retries failed webhook deliveries on a backoff
+    schedule (every minute).
+  - quotaResetJob: resets each tenant's monthly API usage counter once a
+    new calendar month begins (runs daily).
+
+BACKEND — DIRECTORY STRUCTURE (backend/src)
+--------------------------------------------
+  app.ts                     Express app setup, route mounting
+  server.ts                  Entry point — connects DB, starts cron jobs,
+                              starts the HTTP server
+  config/db.ts                Mongo connection
+  models/                     Mongoose schemas (one file per collection)
+    Tenant.ts                 Tenant/workspace, plan, quota fields
+    User.ts                   Dashboard user (owner/admin/viewer), tenant-scoped
+    Asset.ts                  Loan/equity/real-estate/other asset records
+    AssetEvent.ts              Audit trail of status/value changes per asset
+    ApiKey.ts                  External API keys (hashed, per tenant)
+    Webhook.ts                 Registered webhook endpoints + HMAC secret
+    WebhookDelivery.ts          Delivery attempts/retries per webhook event
+    UsageLog.ts                 External API request log (for metering)
+    TestEndpointEvent.ts         Payloads received by the built-in webhook
+                                test endpoint
+  controllers/                 Request handlers, one per resource
+  routes/                      Express routers, one per resource
+  middleware/
+    auth.ts                    JWT verification (dashboard)
+    apiKeyAuth.ts               API key verification (external API)
+    rbac.ts                     Role checks (owner/admin/viewer)
+    rateLimiter.ts               express-rate-limit configs
+    usageLogger.ts               Logs every external API call to UsageLog
+    errorHandler.ts               404 + centralized error handler
+  jobs/
+    webhookRetryJob.ts            Cron: retries pending webhook deliveries
+    quotaResetJob.ts               Cron: monthly quota reset
+  utils/
+    webhookDispatcher.ts           Signs + sends webhook payloads, creates
+                                  WebhookDelivery records, exposes
+                                  retryDelivery() for manual/auto retry
+  types/index.ts                 Shared TS types (AuthRequest, JwtPayload...)
+
+KEY BACKEND CONCEPTS
+--------------------
+Webhook delivery & reliability:
+  - Every dispatched event creates a WebhookDelivery record
+    (status: pending | success | failed | exhausted).
+  - On failure, retries follow a fixed backoff: 1 min, 5 min, 30 min
+    after attempts 1, 2, 3. After 3 failed retries the delivery is marked
+    "exhausted" and stops auto-retrying (still visible for manual resend).
+  - webhookRetryJob (every minute) picks up any "pending" delivery whose
+    nextRetryAt has passed and retries it.
+  - Manual resend: POST /api/webhooks/deliveries/:deliveryId/resend
+    re-attempts immediately regardless of nextRetryAt.
+
+Built-in webhook test endpoint (no third-party tool needed):
+  - Every tenant gets a public URL: POST /api/test-endpoint/:tenantSlug
+    (no auth — external senders won't have a JWT).
+  - Payloads posted there are stored in TestEndpointEvent and shown live
+    in the dashboard (Test Endpoint page, polls every 3s).
+
+Quota tracking:
+  - Tenant.apiRequestsUsedThisMonth increments as external API calls are
+    logged; Tenant.apiRequestQuota is the plan's monthly cap.
+  - quotaResetJob resets the counter once per new calendar month.
+
+Analytics:
+  - GET /api/assets/analytics aggregates real data (no mock numbers):
+    portfolio value grouped by asset type, daily AssetEvent counts
+    (asset activity) for the last 30 days, and daily UsageLog counts
+    (API usage) for the last 30 days.
+
+Dashboard UX safeguards (frontend, mirrors backend RBAC):
+  - The Assets page lets you edit currentValue inline (click the value,
+    type, Enter/blur to save) as well as change status from a dropdown —
+    both call the same PATCH /api/assets/:assetId used by the API.
+  - Controls that require owner/admin (editing/deleting an asset, adding/
+    deleting a webhook, revoking an API key) are hidden or disabled in the
+    UI for a "viewer" role, matching the requireRole() checks the backend
+    already enforces — the UI doesn't offer an action the server would
+    reject.
+  - Every destructive action (delete asset, delete webhook, revoke key)
+    asks for confirmation with the specific name/URL being removed before
+    it fires.
+  - Failed requests surface the server's real error message in an inline
+    banner instead of failing silently.
+
+BACKEND API SUMMARY
+--------------------
+Dashboard API (JWT, header: Authorization: Bearer <token>):
+  POST   /api/auth/register
+  POST   /api/auth/login
+  GET    /api/auth/me
+  GET    /api/assets
+  GET    /api/assets/analytics
+  GET    /api/assets/:assetId
+  POST   /api/assets
+  PATCH  /api/assets/:assetId
+  DELETE /api/assets/:assetId
+  GET    /api/keys
+  POST   /api/keys
+  DELETE /api/keys/:keyId
+  GET    /api/webhooks
+  POST   /api/webhooks
+  DELETE /api/webhooks/:webhookId
+  GET    /api/webhooks/:webhookId/deliveries
+  POST   /api/webhooks/deliveries/:deliveryId/resend
+  GET    /api/test-endpoint-events
+
+Public/no-auth:
+  POST   /api/test-endpoint/:tenantSlug     (external webhook test sink)
+  GET    /                                  (API status)
+  GET    /health                            (health check)
+
+External API (API key, header: X-API-Key: <key>):
+  GET    /v1/assets
+  POST   /v1/assets
+  POST   /v1/assets/bulk            (import up to 100 assets in one call;
+                                     partial success — each row is validated
+                                     and created independently, response is
+                                     207 with a per-index results array)
+  PATCH  /v1/assets/:assetId
+
+FRONTEND — DIRECTORY STRUCTURE (frontend/src)
+-----------------------------------------------
+  main.tsx                    React entry point
+  App.tsx                     Router setup, all routes
+  App.css                     Design system (colors, components, layout)
+  api/client.ts                axios instance, attaches JWT from localStorage
+  context/AuthContext.tsx       Auth state (user, tenant, token), login/logout
+  components/
+    DashboardLayout.tsx          Sidebar (lucide-react icons) + shell used by
+                                every dashboard page
+    ProtectedRoute.tsx            Redirects to /login if not authenticated
+    landing/                     Landing page sections, one component each:
+      LandingNav.tsx                Sticky nav — transparent/light text over
+                                  the dark hero, blurs to solid + dark text
+                                  once scrolled past it
+      LandingHero.tsx               Dark hero: headline, CTAs, and an
+                                  interactive terminal card (real curl
+                                  request/response, tilts toward the cursor)
+      LandingSocialProof.tsx        A row of real capability chips (tenant
+                                  isolation, signed webhooks, retries,
+                                  usage metering) — no invented metrics
+      LandingStory.tsx              Scroll-driven narrative: 4 real steps
+                                  (add asset -> register webhook -> status
+                                  change fires it -> retry/exhaust if the
+                                  receiver is down) paired with a sticky
+                                  terminal panel whose content swaps per
+                                  step as it scrolls into view
+      LandingCodeSample.tsx         API code sample panel
+      LandingCta.tsx                Closing call-to-action band
+      LandingFooter.tsx             Footer
+      Reveal.tsx                    Scroll-reveal wrapper (IntersectionObserver)
+                                  used to fade/slide sections in on scroll
+  pages/
+    LandingPage.tsx               Public marketing page at "/"
+    Login.tsx / Register.tsx      Auth screens
+    Overview.tsx                  Dashboard home — KPIs + status breakdown
+    Analytics.tsx                 Charts: value by type, activity, API usage
+    Assets.tsx                    Asset CRUD table
+    ApiKeys.tsx                   API key management (create/revoke)
+    Webhooks.tsx                  Webhook registration/list/delete
+    WebhookDeliveries.tsx          Per-webhook delivery log + resend
+    TestEndpoint.tsx                Built-in webhook test sink viewer
+    ApiDocs.tsx                     In-app API documentation page
+  types/index.ts                  Shared TS interfaces matching API shapes
+
+ROUTING
+-------
+  /                                        Landing page (redirects to
+                                           /dashboard if already logged in)
+  /login, /register                        Auth screens
+  /dashboard                               Overview (protected)
+  /dashboard/analytics                      Analytics (protected)
+  /dashboard/assets                         Assets (protected)
+  /dashboard/api-keys                       API Keys (protected)
+  /dashboard/webhooks                       Webhooks (protected)
+  /dashboard/webhooks/:webhookId/deliveries  Webhook Deliveries (protected)
+  /dashboard/test-endpoint                  Test Endpoint (protected)
+  /dashboard/docs                           API Docs (protected)
+
+"Protected" routes require a valid JWT (enforced client-side by
+ProtectedRoute, and server-side by the `protect` middleware on every
+dashboard API route).
+
+LOCAL DEVELOPMENT SETUP
+------------------------
+Prerequisites: Node.js 18+, a MongoDB connection string (Atlas or local).
+
+1. Backend
+   cd backend
+   copy .env.example .env        (Windows)  /  cp .env.example .env (bash)
+   Fill in MONGO_URI and JWT_SECRET in .env
+   npm install
+   npm run dev                   Starts the API on http://localhost:5000
+
+2. Frontend
+   cd frontend
+   copy .env.example .env
+   Set VITE_API_URL if the backend isn't on the default port
+   npm install
+   npm run dev                   Starts Vite on http://localhost:5173
+
+3. Open http://localhost:5173, register a workspace, and use the app.
+
+BUILDING FOR PRODUCTION
+------------------------
+Backend:  cd backend  && npm run build   (compiles TypeScript to dist/)
+          npm start                      (runs dist/server.js)
+Frontend: cd frontend && npm run build   (type-checks + Vite production
+          build to dist/)
+
+ENVIRONMENT VARIABLES
+----------------------
+backend/.env
+  PORT              Port the API listens on (default 5000)
+  MONGO_URI         MongoDB connection string
+  JWT_SECRET         Secret used to sign dashboard JWTs
+  JWT_EXPIRES_IN      JWT lifetime (e.g. "7d")
+  CLIENT_URL          Frontend origin, used for CORS
+  NODE_ENV            development | production
+
+frontend/.env
+  VITE_API_URL        Base URL of the backend Dashboard API
+                     (e.g. http://localhost:5000/api)
+
+SECURITY NOTES
+---------------
+  - Passwords hashed with bcryptjs; never stored or logged in plaintext.
+  - Webhook payloads are HMAC-SHA256 signed (X-PortfolioPulse-Signature
+    header) using a per-webhook secret so receivers can verify authenticity.
+  - API keys are tenant-scoped and checked via apiKeyAuth middleware;
+    the raw key is only shown once at creation time.
+  - Every dashboard and external API query is scoped to req.tenantId /
+    req.apiKeyTenantId — no endpoint trusts a client-supplied tenant ID.
